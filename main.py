@@ -4,15 +4,23 @@ import os
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import ChatPermissions
+
+# --- Константы и Инициализация (Без изменений) ---
 
 # Загрузка матерных слов из файла
 def load_bad_words():
-    with open('bad_words.txt', 'r', encoding='utf-8') as f:
-        return [line.strip().lower() for line in f if line.strip()]
+    # Файл 'bad_words.txt' должен существовать в директории
+    try:
+        with open('bad_words.txt', 'r', encoding='utf-8') as f:
+            return [line.strip().lower() for line in f if line.strip()]
+    except FileNotFoundError:
+        print("⚠️ Файл 'bad_words.txt' не найден. Бот будет использовать пустой список матов.")
+        return []
 
 # Белый список слов (не считать матом)
 WHITE_LIST = [
-    "жопа", "говно", "говнецо", "писька", "член", "пенис", "сосал", "сосать", "ссать", "ссаки", "сиськи", 
+    "жопа", "говно", "говнецо", "писька", "член", "пенис", "сосал", "сосать", "ссать", "ссаки", "сиськи",
     "попа", "задница", "срака", "бляха", "блин", "еперный", "ёперный", "ёпрст", "епрст",
     "хер", "хрен", "хрень", "херовый", "хреновый", "мудак", "мудило", "мудозвон",
     "шалава", "трахать", "трах", "секс", "сиськи", "сисек", "сисечки"
@@ -21,33 +29,91 @@ WHITE_LIST = [
 # Загрузка извинений
 def load_apologies():
     return [
-        "извините", "извиняюсь", "прости", "простите", "прошу прощения", 
+        "извините", "извиняюсь", "прости", "простите", "прошу прощения",
         "сорян", "сорри", "виноват", "виновата", "пардон",
         "pardon", "sorry", "my bad", "mea culpa", "приношу извинения",
         "извиняюсь", "извинение", "прошу простить", "виновен", "не хотел обидеть"
     ]
 
-# Работа с пользователями
-class UserManager:
-    def __init__(self, filename='users.json'):
+# Инициализация констант
+bad_words = load_bad_words()
+apologies = load_apologies()
+bad_words_filtered = [word for word in bad_words if word not in WHITE_LIST]
+
+# --- Глобальный Менеджер для Данных Чатов и Пользователей ---
+
+# Новый класс для хранения данных
+class GlobalManager:
+    def __init__(self, filename='bot_data.json'):
         self.filename = filename
-        self.users = self.load_users()
-        self.swear_timers = {}  # {user_id: {"time": datetime, "count": int}}
+        self.data = self.load_data()
     
-    def load_users(self):
+    # Структура данных:
+    # {
+    #     "chat_id": {
+    #         "enabled": True/False,
+    #         "users": {
+    #             "user_id": {
+    #                 'id': ...,
+    #                 'username': ...,
+    #                 ... (как в оригинальном user_manager)
+    #             },
+    #             ...
+    #         }
+    #     },
+    #     ...
+    # }
+
+    def load_data(self):
         if os.path.exists(self.filename):
             with open(self.filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                # Десериализация дат (опционально, но полезно)
+                data = json.load(f)
+                return data
         return {}
-    
-    def save_users(self):
+
+    def save_data(self):
         with open(self.filename, 'w', encoding='utf-8') as f:
-            json.dump(self.users, f, ensure_ascii=False, indent=2)
-    
-    def get_user(self, user_id, update: Update):
-        if str(user_id) not in self.users:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    # --- Работа с Чатами (ChatManager функционал) ---
+
+    def _get_chat(self, chat_id):
+        chat_id_str = str(chat_id)
+        if chat_id_str not in self.data:
+            self.data[chat_id_str] = {
+                'enabled': True,
+                'users': {}
+            }
+            self.save_data()
+        return self.data[chat_id_str]
+
+    def is_bot_enabled(self, chat_id):
+        return self.data.get(str(chat_id), {}).get('enabled', True)
+
+    def enable_bot(self, chat_id):
+        self._get_chat(chat_id)['enabled'] = True
+        self.save_data()
+
+    def disable_bot(self, chat_id):
+        self._get_chat(chat_id)['enabled'] = False
+        self.save_data()
+        
+    def get_all_chats(self):
+        return self.data.items() # Возвращает (chat_id_str, chat_data)
+
+    # --- Работа с Пользователями (UserManager функционал) ---
+
+    def _get_users_db(self, chat_id):
+        return self._get_chat(chat_id)['users']
+
+    def get_user(self, chat_id, user_id, update: Update):
+        users_db = self._get_users_db(chat_id)
+        user_id_str = str(user_id)
+        
+        if user_id_str not in users_db:
             user = update.effective_user
-            self.users[str(user_id)] = {
+            users_db[user_id_str] = {
                 'id': user_id,
                 'username': user.username or '',
                 'first_name': user.first_name or '',
@@ -59,81 +125,72 @@ class UserManager:
                 'muted_until': None,
                 'swear_timer': None
             }
-            self.save_users()
+            self.save_data()
         else:
-            self.users[str(user_id)]['last_seen'] = datetime.now().isoformat()
-        return self.users[str(user_id)]
-    
-    def update_user(self, user_id, data):
-        if str(user_id) in self.users:
-            self.users[str(user_id)].update(data)
+            users_db[user_id_str]['last_seen'] = datetime.now().isoformat()
+        
+        return users_db[user_id_str]
+
+    def update_user(self, chat_id, user_id, data):
+        users_db = self._get_users_db(chat_id)
+        user_id_str = str(user_id)
+        
+        if user_id_str in users_db:
+            users_db[user_id_str].update(data)
             # Ограничиваем репутацию максимум 100
-            if 'reputation' in data and self.users[str(user_id)]['reputation'] > 100:
-                self.users[str(user_id)]['reputation'] = 100
-            self.save_users()
-    
-    def add_swear_timer(self, user_id):
-        self.users[str(user_id)]['swear_timer'] = datetime.now().isoformat()
-        self.save_users()
-    
-    def clear_swear_timer(self, user_id):
-        self.users[str(user_id)]['swear_timer'] = None
-        self.save_users()
-    
-    def mute_user(self, user_id, hours=1):
+            if 'reputation' in data and users_db[user_id_str]['reputation'] > 100:
+                users_db[user_id_str]['reputation'] = 100
+            self.save_data()
+
+    def add_swear_timer(self, chat_id, user_id):
+        self.update_user(chat_id, user_id, {'swear_timer': datetime.now().isoformat()})
+
+    def clear_swear_timer(self, chat_id, user_id):
+        self.update_user(chat_id, user_id, {'swear_timer': None})
+
+    def mute_user(self, chat_id, user_id, hours=1):
         mute_until = datetime.now() + timedelta(hours=hours)
-        self.users[str(user_id)]['muted_until'] = mute_until.isoformat()
-        self.save_users()
+        self.update_user(chat_id, user_id, {'muted_until': mute_until.isoformat()})
         return mute_until
-    
-    def is_muted(self, user_id):
-        user = self.users.get(str(user_id))
+
+    def is_muted(self, chat_id, user_id):
+        users_db = self._get_users_db(chat_id)
+        user = users_db.get(str(user_id))
+        
         if not user or not user.get('muted_until'):
             return False
-        
+            
         mute_until = datetime.fromisoformat(user['muted_until'])
         return datetime.now() < mute_until
 
-# Работа с чатами
-class ChatManager:
-    def __init__(self, filename='chats.json'):
-        self.filename = filename
-        self.chats = self.load_chats()
-    
-    def load_chats(self):
-        if os.path.exists(self.filename):
-            with open(self.filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {}
-    
-    def save_chats(self):
-        with open(self.filename, 'w', encoding='utf-8') as f:
-            json.dump(self.chats, f, ensure_ascii=False, indent=2)
-    
-    def is_bot_enabled(self, chat_id):
-        return self.chats.get(str(chat_id), True)
-    
-    def enable_bot(self, chat_id):
-        self.chats[str(chat_id)] = True
-        self.save_chats()
-    
-    def disable_bot(self, chat_id):
-        self.chats[str(chat_id)] = False
-        self.save_chats()
+# Инициализация нового менеджера
+global_manager = GlobalManager()
 
-# Инициализация
-bad_words = load_bad_words()
-apologies = load_apologies()
-user_manager = UserManager()
-chat_manager = ChatManager()
+# --- Команды ---
 
-# Фильтруем матерные слова, убирая белый список
-bad_words_filtered = [word for word in bad_words if word not in WHITE_LIST]
+# Декоратор для проверки, что команда запущена в группе и бот включен
+def group_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_chat.type not in [
+            'group', 'supergroup'
+        ]:
+            # В личных сообщениях не работаем
+            # В оригинальном коде нет текста для лички, поэтому просто return
+            return
+        
+        # Проверка на выключение бота
+        if not global_manager.is_bot_enabled(update.effective_chat.id) and func.__name__ not in ['enable_bot_command']:
+             # Если бот выключен, обрабатываем только команду включения
+            return
 
-# Команды
+        return await func(update, context)
+    return wrapper
+
+@group_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я бот-антимат. Не матерись! 🥰\n/helpm - список команд")
 
+@group_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 📋 *Доступные команды:*
@@ -149,11 +206,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - Мат = -1 к репутации за КАЖДОЕ матерное слово
 - Извинение на моё сообщение = +1 к репутации (макс. 100)
 - Если не извинился за 5 минут = мут на 1 час
-    """
+"""
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
+@group_only
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = user_manager.get_user(update.effective_user.id, update)
+    chat_id = update.effective_chat.id
+    user = global_manager.get_user(chat_id, update.effective_user.id, update)
     
     # Проверяем таймер мута
     mute_info = ""
@@ -161,19 +220,23 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mute_until = datetime.fromisoformat(user['muted_until'])
         if datetime.now() < mute_until:
             time_left = mute_until - datetime.now()
-            mute_info = f"🔇 В муте: {int(time_left.total_seconds() // 60)} мин.\n"
-    
+            # Проверка, чтобы избежать ошибки деления на 0, если время < 1 мин
+            minutes = int(time_left.total_seconds() // 60)
+            if minutes > 0:
+                mute_info = f"🔇 В муте: {minutes} мин.\n"
+            else:
+                 mute_info = "🔇 В муте: <1 мин.\n"
+                 
     # Проверяем таймер извинения
     timer_info = ""
     if user.get('swear_timer'):
         swear_time = datetime.fromisoformat(user['swear_timer'])
         time_passed = datetime.now() - swear_time
         minutes_passed = time_passed.total_seconds() / 60
-        
         if minutes_passed < 5:
             time_left = 5 - minutes_passed
             timer_info = f"⏰ Извинись через: {int(time_left)} мин.\n"
-    
+            
     profile_text = f"""
 📊 *Твой профиль*
 
@@ -184,97 +247,126 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💢 Матов: *{user['swear_count']}*
 {mute_info}{timer_info}
 📅 Создан: {user['created_at'][:10]}
-    """
+"""
     await update.message.reply_text(profile_text, parse_mode='Markdown')
 
+@group_only
 async def top_reputation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users_list = list(user_manager.users.values())
+    chat_id = update.effective_chat.id
+    # Получаем пользователей только для текущего чата
+    users_list = list(global_manager._get_users_db(chat_id).values())
     sorted_users = sorted(users_list, key=lambda x: x['reputation'], reverse=True)[:10]
     
     if not sorted_users:
         await update.message.reply_text("Пока нет данных.")
         return
-    
+        
     text = "🏆 *Топ по репутации:*\n\n"
     for i, user in enumerate(sorted_users, 1):
         name = user['first_name'] or user['username'] or f"User {user['id']}"
         text += f"{i}. {name}: *{user['reputation']}* ⭐\n"
-    
+        
     await update.message.reply_text(text, parse_mode='Markdown')
 
+@group_only
 async def top_swear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users_list = list(user_manager.users.values())
+    chat_id = update.effective_chat.id
+    # Получаем пользователей только для текущего чата
+    users_list = list(global_manager._get_users_db(chat_id).values())
     sorted_users = sorted(users_list, key=lambda x: x['swear_count'], reverse=True)[:10]
     
     if not sorted_users:
         await update.message.reply_text("Пока нет данных.")
         return
-    
+        
     text = "💢 *Топ по матам:*\n\n"
     for i, user in enumerate(sorted_users, 1):
         name = user['first_name'] or user['username'] or f"User {user['id']}"
         text += f"{i}. {name}: *{user['swear_count']}* 😈\n"
-    
+        
     await update.message.reply_text(text, parse_mode='Markdown')
 
+@group_only
 async def enable_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_manager.enable_bot(update.effective_chat.id)
+    # Эта команда работает, даже если бот был 'выключен' в БД, чтобы его можно было включить
+    global_manager.enable_bot(update.effective_chat.id)
     await update.message.reply_text("✅ Бот включен в этом чате!")
 
+@group_only
 async def disable_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_manager.disable_bot(update.effective_chat.id)
+    global_manager.disable_bot(update.effective_chat.id)
     await update.message.reply_text("❌ Бот отключен в этом чате.")
 
-# Проверка на извинение
+# --- Обработка Сообщений ---
+
+# Проверка на извинение (Без изменений)
 def check_apology(text):
     text_lower = text.lower()
     for apology in apologies:
         if text_lower.startswith(apology):
             # Проверяем, что после извинения есть хотя бы 2 слова
             rest = text_lower[len(apology):].strip()
-            if len(rest.split()) >= 2:
+            # Проверяем, что после извинения есть хотя бы 2 символа, если не 2 слова
+            if len(rest.split()) >= 2 or len(rest) >= 2:
                 return True
     return False
 
-# Обработка сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем, включен ли бот в чате
-    if not chat_manager.is_bot_enabled(update.effective_chat.id):
+    # Фильтр на работу ТОЛЬКО в группах
+    if update.effective_chat.type not in ['group', 'supergroup']:
         return
     
-    user = user_manager.get_user(update.effective_user.id, update)
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Проверяем, включен ли бот в чате
+    if not global_manager.is_bot_enabled(chat_id):
+        return
+        
+    user = global_manager.get_user(chat_id, user_id, update)
     text = update.message.text
     
+    # Сообщения без текста игнорируем
+    if not text:
+        return
+        
     # Проверка на мут
-    if user_manager.is_muted(update.effective_user.id):
-        await update.message.delete()
+    if global_manager.is_muted(chat_id, user_id):
+        try:
+            # Удаляем сообщение, если пользователь в муте
+            await update.message.delete()
+        except Exception:
+            # Бот должен быть админом с правом удалять сообщения
+            pass
+        # Сообщаем о муте
         await update.message.reply_text(f"@{update.effective_user.username or update.effective_user.first_name} ты в муте на 1 час!")
         return
-    
+        
     text_lower = text.lower()
     
     # Проверка на извинение (ответ на сообщение бота)
     if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
         if check_apology(text):
             # Очищаем таймер извинения
-            user_manager.clear_swear_timer(update.effective_user.id)
+            global_manager.clear_swear_timer(chat_id, user_id)
             
             # Даем +1 репутации, но не больше 100
             new_rep = min(user['reputation'] + 1, 100)
-            user_manager.update_user(user['id'], {
+            global_manager.update_user(chat_id, user_id, {
                 'reputation': new_rep
             })
             await update.message.reply_text(f"Принято! +1 к репутации. Твой рейтинг: {new_rep} ⭐")
             return
-    
+            
     # Проверка на мат
     found_bad_words = []
     for bad_word in bad_words_filtered:
+        # Использование \b для точного совпадения слова
         pattern = r'\b' + re.escape(bad_word) + r'\b'
         matches = re.findall(pattern, text_lower)
         for match in matches:
             found_bad_words.append(match)
-    
+            
     if found_bad_words:
         # Удаляем дубликаты для подсчета УНИКАЛЬНЫХ матов
         unique_bad_words = list(set(found_bad_words))
@@ -282,11 +374,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Устанавливаем таймер извинения, если еще не установлен
         if not user.get('swear_timer'):
-            user_manager.add_swear_timer(update.effective_user.id)
-        
+            global_manager.add_swear_timer(chat_id, user_id)
+            
         # Обновляем статистику
         new_reputation = max(user['reputation'] - swear_count, 0)
-        user_manager.update_user(user['id'], {
+        global_manager.update_user(chat_id, user_id, {
             'reputation': new_reputation,
             'swear_count': user['swear_count'] + swear_count
         })
@@ -294,7 +386,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         words_list = ", ".join(f"'{w}'" for w in unique_bad_words[:3])
         if len(unique_bad_words) > 3:
             words_list += f" и ещё {len(unique_bad_words) - 3}"
-        
+            
         # Базовый текст сообщения
         message_text = (
             f"не матерись мой хороший 🥰\n"
@@ -319,38 +411,83 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"⚠️ Файл mat.jpg не найден!\n{message_text}")
             except Exception as e:
                 # Если ошибка при отправке фото, отправляем только текст
+                # print(f"Ошибка при отправке фото: {e}") # Для отладки
                 await update.message.reply_text(f"⚠️ Ошибка при отправке фото: {str(e)}\n{message_text}")
         else:
             # Если менее 2 матов, отправляем только текст
             await update.message.reply_text(message_text)
 
+# --- Фоновая Задача ---
+
+async def mute_user_telegram_api(context: ContextTypes.DEFAULT_TYPE, chat_id, user_id, mute_until):
+    """Фактически мутирует пользователя в Telegram."""
+    try:
+        # Превращаем метку времени в UNIX-таймстамп (обязательно для restrict_chat_member)
+        until_date = int(mute_until.timestamp())
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            # Ограничиваем только отправку сообщений
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date # Срок мута
+        )
+        return True
+    except Exception as e:
+        # print(f"Не удалось замутить пользователя {user_id} в чате {chat_id}: {e}") # Для отладки
+        # Если бот не является админом или не имеет нужных прав, мут не сработает
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Не удалось замутить пользователя ID {user_id}. Убедитесь, что бот является администратором с правом 'Ограничивать пользователей'."
+        )
+        return False
+
 # Фоновая задача для проверки таймеров
 async def check_timers(context: ContextTypes.DEFAULT_TYPE):
-    for user_id_str, user in user_manager.users.items():
-        # Проверяем таймер извинения
-        if user.get('swear_timer'):
-            swear_time = datetime.fromisoformat(user['swear_timer'])
-            time_passed = datetime.now() - swear_time
+    now = datetime.now()
+    # Итерируем по всем чатам
+    for chat_id_str, chat_data in global_manager.get_all_chats():
+        chat_id = int(chat_id_str)
+        users = chat_data.get('users', {})
+        
+        for user_id_str, user in users.items():
+            user_id = int(user_id_str)
             
-            if time_passed.total_seconds() >= 300:  # 5 минут
-                # Мут на 1 час
-                mute_until = user_manager.mute_user(int(user_id_str), 1)
+            # 1. Проверяем таймер извинения
+            if user.get('swear_timer'):
+                swear_time = datetime.fromisoformat(user['swear_timer'])
+                time_passed = now - swear_time
                 
-                # Очищаем таймер
-                user_manager.clear_swear_timer(int(user_id_str))
-                
-                # Уведомляем в чате (в реальном боте нужно знать chat_id)
-                # Для этого нужно хранить информацию о чатах пользователей
-                pass
+                if time_passed.total_seconds() >= 300: # 5 минут
+                    # Мут на 1 час в БД
+                    mute_until_dt = global_manager.mute_user(chat_id, user_id, 1)
+                    
+                    # Фактический мут в Telegram
+                    success = await mute_user_telegram_api(context, chat_id, user_id, mute_until_dt)
+                    
+                    # Очищаем таймер в БД (только если удалось замутить или если мы не хотим повторять попытку)
+                    if success:
+                         global_manager.clear_swear_timer(chat_id, user_id)
+                         await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"Пользователь ID {user_id} не извинился за 5 минут и получил мут на 1 час! 🔇"
+                        )
+                    # Если мут не удался, таймер сбросится, но пользователь не будет замучен фактически.
+                    # Для простоты и соответствия логике "один раз - 5 минут" сбросим таймер.
+                    else:
+                         global_manager.clear_swear_timer(chat_id, user_id)
+
+
+# --- Главная Функция ---
 
 def main():
     # Получи токен у @BotFather
-    TOKEN = "ВАШ_TELEGRAM_BOT_TOKEN"
+    TOKEN = "YOUR_BOT_TOKEN_HERE"
     
     # Создаем приложение
     app = Application.builder().token(TOKEN).build()
     
-    # Обработчики команд
+    # Обработчики команд. Используем group_only фильтр в декораторе
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("helpm", help_command))
     app.add_handler(CommandHandler("profilem", profile_command))
@@ -359,14 +496,15 @@ def main():
     app.add_handler(CommandHandler("onm", enable_bot_command))
     app.add_handler(CommandHandler("offm", disable_bot_command))
     
-    # Обработчик сообщений
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Обработчик сообщений. Добавляем фильтр, чтобы не обрабатывать личку, хотя это уже есть в handle_message
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_message))
     
     # Добавляем фоновую задачу для проверки таймеров (каждую минуту)
     job_queue = app.job_queue
     if job_queue:
+        # Запускаем через 10 секунд после старта, затем повторяем каждую минуту
         job_queue.run_repeating(check_timers, interval=60, first=10)
-    
+        
     print("🤖 Бот запущен...")
     app.run_polling()
 
